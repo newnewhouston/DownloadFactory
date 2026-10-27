@@ -4,7 +4,7 @@ One Factory-line console that unifies four downloaders behind a single local pag
 with a **hard, fail-closed VPN gate on torrents**.
 
 ```bash
-Start DownloadFactory.bat
+py -3 "DownloadFactory 1.0.py"
 ```
 
 Then open <http://127.0.0.1:8133>. Flags: `--port N`, `--no-browser`, `--selftest`.
@@ -145,7 +145,9 @@ kill switch. Video and Galleries are HTTP and deliberately **not** hard-gated.
 | 6975–6978 | Hitomi Downloader HTTP API (probed in order) |
 | 51413 | Transmission **peer** port — the only intentionally reachable port, and only via the VPN |
 
-Everything binds `127.0.0.1`. No LAN exposure, no cloud.
+Everything binds `127.0.0.1`. No LAN exposure, no cloud. The shell also refuses requests
+that come from any *other* web page — a cross-origin `Origin`, or a DNS-rebound `Host` —
+so a site open in your browser can't disconnect the VPN or push a torrent through it.
 
 **Only one copy can run at a time.** Transmission's RPC port is fixed, so a second shell
 could never own the daemon — it would just take the next free shell port and then loop
@@ -221,8 +223,9 @@ ISP first, then your PIA server's network. A bare match against `piactl get pubi
 trusted on its own: pubip can report your real ISP address, and a leaking announce would
 then "match" it. With the VPN off the probe is refused, so nothing ever announces.
 
-Run `py -3 "DownloadFactory 1.0.py" --selftest` for 40 headless assertions covering the
-gate, fail-closed behaviour, the settings writer, secret hygiene and the ipleak parsers.
+Run `py -3 "DownloadFactory 1.0.py" --selftest` for 60-odd headless assertions covering the
+gate, fail-closed behaviour, the settings writer, secret hygiene, the ipleak parsers and
+verdicts, and the local-only API guard.
 
 ---
 

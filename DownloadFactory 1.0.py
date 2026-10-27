@@ -3,7 +3,7 @@ DownloadFactory v1.0
 One Factory-line console that unifies four downloaders behind a single local
 page, with a HARD, FAIL-CLOSED VPN GATE on torrents.
 
-  Video      - YT-DLP GUI v1.4, managed worker on 127.0.0.1:7331 (iframe)
+  Video      - YT-DLP GUI v1.4, managed worker on 127.0.0.1:7331 (native pane, proxied)
   Torrents   - Transmission 4.1.3 daemon, spawned + driven over RPC   <-- GATED
   Galleries  - Hitomi Downloader (owner-supplied exe), HTTP API       (iframe)
   VPN & Leak - PIA via piactl + ipleak.net egress/DNS/torrent-address checks
