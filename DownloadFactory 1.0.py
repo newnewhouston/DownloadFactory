@@ -3,7 +3,7 @@ DownloadFactory v1.0
 One Factory-line console that unifies four downloaders behind a single local
 page, with a HARD, FAIL-CLOSED VPN GATE on torrents.
 
-  Video      - YT-DLP GUI v1.4, managed worker on 127.0.0.1:7331 (iframe)
+  Video      - YT-DLP GUI v1.4, managed worker on 127.0.0.1:7331 (native pane, proxied)
   Torrents   - Transmission 4.1.3 daemon, spawned + driven over RPC   <-- GATED
   Galleries  - Hitomi Downloader (owner-supplied exe), HTTP API       (iframe)
   VPN & Leak - PIA via piactl + ipleak.net egress/DNS/torrent-address checks
@@ -24,6 +24,7 @@ Localhost only. No LAN exposure, no cloud. Secrets never touch this folder.
 
 import argparse
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -336,6 +337,7 @@ class AppState:
         self.last_dns = None
         self.events = []                # rolling activity log for the UI
         self.monitor_alive = False
+        self.transitions = 0            # bumped per state change; see on_state_change
 
     def event(self, kind, msg):
         with self.lock:
@@ -505,6 +507,16 @@ def _existing_instance(port):
         return False
 
 
+def _bindable_ipv4(s):
+    """True only for a real dotted-quad IPv4 other than 0.0.0.0. A shape-only
+    regex would pass 999.1.1.1 (invalid, so Transmission falls back to every
+    interface) and 0.0.0.0 itself (every interface) - both full leaks."""
+    try:
+        return not ipaddress.IPv4Address(s).is_unspecified
+    except ValueError:
+        return False
+
+
 class TransmissionDaemon:
     """Owns transmission-daemon.exe as a foreground child process.
 
@@ -525,7 +537,7 @@ class TransmissionDaemon:
         back to 0.0.0.0 (a full leak) in that case. When there is no VPN we
         deliberately bind 127.0.0.1 so peer binds FAIL instead of leaking.
         """
-        if not bind_ipv4 or not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", bind_ipv4):
+        if not _bindable_ipv4(bind_ipv4):
             bind_ipv4 = "127.0.0.1"  # fail-closed, never blank
         os.makedirs(TR_CONFIG_DIR, exist_ok=True)
         os.makedirs(TR_DOWNLOAD_DIR, exist_ok=True)  # free-space RPC needs it to exist
@@ -774,6 +786,9 @@ def on_state_change(state):
     with STATE.lock:
         prev = STATE.vpn
         STATE.vpn = state
+        if state != prev:
+            STATE.transitions += 1
+        gen = STATE.transitions
     if state == prev:
         return
 
@@ -796,13 +811,22 @@ def on_state_change(state):
         elif not DAEMON.running():
             DAEMON.start(bind, paused=True)
         apply_port_forward()
+        pub = pub_ip()
         with STATE.lock:
-            STATE.pub_ip = pub_ip()
+            # The rebind above can take tens of seconds, and the poll thread
+            # may have handled a drop meanwhile. Unblocking now would undo that
+            # stop - and the monitor's queued line for the drop is then a
+            # repeat of the current state, so nothing would ever re-stop it.
+            # Only the newest transition gets to open the gate.
+            if STATE.transitions != gen:
+                return
+            STATE.pub_ip = pub
             STATE.blocked = False
             STATE.banner = ""
         # Torrents stay paused by design; the user resumes. Opt-in auto-resume
-        # only ever touches the exact set the watchdog itself paused.
-        if CFG["pia"].get("auto_resume_after_reconnect"):
+        # only ever touches the exact set the watchdog itself paused, and goes
+        # through the live gate like any other start.
+        if CFG["pia"].get("auto_resume_after_reconnect") and gate_ok():
             with STATE.lock:
                 hashes = list(STATE.watchdog_paused)
                 STATE.watchdog_paused = []
@@ -943,11 +967,19 @@ class YtdlpWorker:
             pass
         return None
 
+    STILL_STARTING = ("the worker is still starting - its first run installs ffmpeg/node "
+                      "via winget and can take a few minutes")
+
     def start(self):
         if self.health():
             self.adopted = True   # already running (dev server, earlier session)
             self.error = ""
             return True
+        if self.proc is not None and self.proc.poll() is None:
+            # Ours, alive, just not answering yet. Another copy would only
+            # race it for the port.
+            self.error = self.STILL_STARTING
+            return False
         cmds = []
         if os.path.exists(self.script):
             cmds.append([sys.executable, self.script, "--no-browser", "--port", str(self.port)])
@@ -974,7 +1006,12 @@ class YtdlpWorker:
                     STATE.event("video", f"yt-dlp worker up on {self.port}")
                     return True
                 time.sleep(0.5)
-            self.error = "worker started but /health never answered"
+            if self.proc.poll() is None:
+                # Slow, not dead: leave it to finish rather than launching
+                # the fallback on top of it.
+                self.error = self.STILL_STARTING
+                return False
+            self.error = f"worker exited before /health answered (rc={self.proc.returncode})"
         return False
 
     def _session_token(self):
@@ -1306,6 +1343,32 @@ def human_bytes(n):
     return f"{n:.1f} PB"
 
 
+@app.before_request
+def _local_page_only():
+    """Refuse requests that some OTHER web page aimed at us.
+
+    Binding 127.0.0.1 keeps the LAN out, not the browser: any site the user
+    has open can auto-submit a form to http://127.0.0.1:8133/api/... - no
+    CORS preflight is needed for a form post. Unchecked, that would let a
+    random page disconnect the VPN, shut the app down, or push a .torrent
+    through the multipart branch of /api/torrent/add.
+
+      * Host must be loopback. A DNS-rebinding page arrives carrying its own
+        hostname, and this is what stops it reading /api/state.
+      * A mutating request carrying an Origin must carry OUR origin.
+        Browsers always send Origin on a cross-origin POST; curl and the
+        self-test send none, so those still work.
+    """
+    if request.host.split(":", 1)[0].lower() not in ("127.0.0.1", "localhost"):
+        return jsonify(ok=False, error="forbidden host"), 403
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    origin = request.headers.get("Origin")
+    if origin is not None and origin.lower() != f"http://{request.host}".lower():
+        return jsonify(ok=False, error="cross-origin request refused"), 403
+    return None
+
+
 @app.after_request
 def _no_store(resp):
     resp.headers["Cache-Control"] = "no-store"
@@ -1554,6 +1617,47 @@ def _remember_baseline(res):
         pass
 
 
+def _egress_verdict(ip, asn, isp, pia_pubip, base):
+    """(verdict, detail) for an address the outside world saw while PIA claims
+    to be up. The IP check and the torrent probe both go through here so the
+    two can never disagree about what counts as a leak.
+
+    Order matters. piactl's pubip has been seen reporting the REAL ISP
+    address on a healthy tunnel, so a leak can "match" it too - the real-ISP
+    baseline is checked before pubip is consulted at all.
+    """
+    if base and ((asn and asn == base.get("asn")) or ip == base.get("ip")):
+        return "leak", (f"Egress is on your REAL ISP ({isp or base.get('isp')}) - traffic "
+                        f"is bypassing the tunnel. This is a genuine leak.")
+    if pia_pubip and ip == pia_pubip:
+        return "vpn", "Egress matches PIA's reported public IP."
+    # Positive proof, independent of any baseline: does the egress sit in
+    # the same network as the PIA endpoint we are tunnelled to? If so the
+    # tunnel is certainly carrying traffic.
+    endpoint_asn = _endpoint_asn()
+    if endpoint_asn and asn == endpoint_asn:
+        return "vpn", (f"Egress is on the same network as the PIA server we are "
+                       f"connected to ({isp}, AS{endpoint_asn}). The tunnel is holding."
+                       + (" (piactl's pubip disagrees, which is common on OpenVPN "
+                          "- the observed egress is authoritative.)" if pia_pubip else ""))
+    if base and asn:
+        return "vpn", (f"Egress is {isp or 'a VPN host'}, not your real "
+                       f"ISP ({base.get('isp')}). The tunnel is holding.")
+    if base:
+        # A different IP alone proves nothing: the real ISP may simply have
+        # handed out a new dynamic address. Without the ASN we cannot tell.
+        return "unknown", (f"Couldn't look up which network {ip} belongs to, so it "
+                           f"can't be compared against your real ISP "
+                           f"({base.get('isp')}). Re-run the check.")
+    # No baseline AND no endpoint match: we genuinely cannot prove this
+    # either way. Saying "holding" here would be a green light we have
+    # not earned - a real leak would land in exactly this branch.
+    return "unknown", (f"Egress is {isp or 'unknown'} (AS{asn}), "
+                       "which is neither your PIA server's network nor a known "
+                       "baseline. Run this check once with the VPN OFF so I can "
+                       "learn what your real ISP looks like, then re-run it.")
+
+
 @app.get("/api/leak/ip")
 def api_leak_ip():
     """Verdict logic, rewritten after a live false positive.
@@ -1585,44 +1689,10 @@ def api_leak_ip():
         res["verdict"] = "unknown"
         res["matches_vpn"] = False
         res["detail"] = "Could not reach ipleak.net or the fallback."
-    elif base and (res.get("asn") == base.get("asn") or res.get("ip") == base.get("ip")):
-        res["verdict"] = "leak"
-        res["matches_vpn"] = False
-        res["detail"] = (f"Egress is on your REAL ISP ({res.get('isp')}) - traffic is "
-                         f"bypassing the tunnel. This is a genuine leak.")
-    elif res.get("pia_pubip") and res["ip"] == res["pia_pubip"]:
-        res["verdict"] = "vpn"
-        res["matches_vpn"] = True
-        res["detail"] = "Egress matches PIA's reported public IP."
     else:
-        # Positive proof, independent of any baseline: does the egress sit in
-        # the same network as the PIA endpoint we are tunnelled to? If so the
-        # tunnel is certainly carrying traffic.
-        endpoint_asn = _endpoint_asn()
-        if endpoint_asn and res.get("asn") == endpoint_asn:
-            res["verdict"] = "vpn"
-            res["matches_vpn"] = True
-            res["detail"] = (f"Egress is on the same network as the PIA server we are "
-                             f"connected to ({res.get('isp')}, AS{endpoint_asn}). The "
-                             f"tunnel is holding."
-                             + (" (piactl's pubip disagrees, which is common on OpenVPN "
-                                "- the observed egress is authoritative.)"
-                                if res.get("pia_pubip") and res["ip"] != res["pia_pubip"] else ""))
-        elif base:
-            res["verdict"] = "vpn"
-            res["matches_vpn"] = True
-            res["detail"] = (f"Egress is {res.get('isp') or 'a VPN host'}, not your real "
-                             f"ISP ({base.get('isp')}). The tunnel is holding.")
-        else:
-            # No baseline AND no endpoint match: we genuinely cannot prove this
-            # either way. Saying "holding" here would be a green light we have
-            # not earned - a real leak would land in exactly this branch.
-            res["verdict"] = "unknown"
-            res["matches_vpn"] = False
-            res["detail"] = (f"Egress is {res.get('isp') or 'unknown'} (AS{res.get('asn')}), "
-                             "which is neither your PIA server's network nor a known "
-                             "baseline. Run this check once with the VPN OFF so I can "
-                             "learn what your real ISP looks like, then re-run it.")
+        res["verdict"], res["detail"] = _egress_verdict(
+            res.get("ip"), res.get("asn"), res.get("isp"), res["pia_pubip"], base)
+        res["matches_vpn"] = res["verdict"] == "vpn"
 
     res["checked"] = time.strftime("%H:%M:%S")
     with STATE.lock:
@@ -1655,13 +1725,16 @@ def api_leak_torrent_start():
               f"&tr=https://ipleak.net/announce.php%3Fh%3D{thash}"
               f"&dn=ipleak.net+torrent+detection")
     if not DAEMON.running():
-        DAEMON.start(tunnel_bind_ip(), paused=False)
+        if not DAEMON.start(tunnel_bind_ip(), paused=False):
+            return jsonify(ok=False, error=STATE.tr_error or "Transmission is not running"), 200
     try:
         res = tr.call("torrent-add", {"filename": magnet, "paused": False,
                                       "download-dir": TR_DOWNLOAD_DIR}, timeout=25)
     except TransmissionError as e:
         return jsonify(ok=False, error=str(e)), 200
     added = res.get("torrent-added") or res.get("torrent-duplicate")
+    if not added:
+        return jsonify(ok=False, error="Transmission accepted nothing"), 200
     STATE.event("leak", f"torrent-address probe announced ({thash[:12]}...)")
     return jsonify(ok=True, thash=thash, id=added.get("id"), hash=added.get("hashString"))
 
@@ -1675,7 +1748,13 @@ def api_leak_torrent_poll():
     res["ok"] = True
     res["pia_pubip"] = pub_ip()
     if res.get("detected") and res.get("ip"):
-        res["match"] = (res["ip"] == res["pia_pubip"])
+        # Same rules as the IP check - NOT bare equality with pubip, which can
+        # report the real ISP address and would then call a leak a match.
+        geo = _geo(res["ip"])
+        res.update(isp=geo["isp"], asn=geo["asn"], country=geo["country"])
+        res["verdict"], res["detail"] = _egress_verdict(
+            res["ip"], geo["asn"], geo["isp"], res["pia_pubip"], _baseline_isp())
+        res["match"] = res["verdict"] == "vpn"
     return jsonify(res)
 
 
@@ -2392,8 +2471,8 @@ PAGE = """<!DOCTYPE html>
     <div class="card">
       <h3>Torrent address verification</h3>
       <p class="note">Announces a throwaway hash to ipleak.net's tracker through the
-      <b>same gated path</b> as any torrent, then compares the IP the tracker saw against
-      PIA's public IP. With the VPN off this is refused, so nothing ever announces.</p>
+      <b>same gated path</b> as any torrent, then judges the IP the tracker saw by the same
+      rules as the IP check. With the VPN off this is refused, so nothing ever announces.</p>
       <div class="row" style="margin-top:10px">
         <button class="btn" id="btntorrentprobe">Verify torrent IP</button>
         <button class="btn ghost small" id="btnprobestop" style="display:none">Stop probe</button>
@@ -2480,16 +2559,23 @@ function render() {
     $('egresschip').textContent = 'unchecked';
   }
 
-  /* gate area */
+  /* gate area. render() runs every 2 s, so the banner is only rebuilt when
+     what it says changes - recreating it each tick replayed the pulse forever
+     and could swallow a click on its Connect button mid-press. */
   const g = $('gatearea');
   if (!up) {
-    if (!bannerShown) { bannerShown = true; }
-    g.innerHTML = '<div class="banner pulse"><div class="bt">VPN required</div>' +
-      '<div class="bd">' + esc(s.banner || 'Torrents are blocked until PIA is connected.') +
-      ' The server refuses every add while the VPN is down &mdash; the button below is just a courtesy.' +
-      '</div><div style="margin-top:11px"><button class="btn go" onclick="doConnect()">Connect PIA</button></div></div>';
+    const msg = s.banner || 'Torrents are blocked until PIA is connected.';
+    if (g.dataset.banner !== msg) {
+      g.dataset.banner = msg;
+      g.innerHTML = '<div class="banner' + (bannerShown ? '' : ' pulse') + '"><div class="bt">VPN required</div>' +
+        '<div class="bd">' + esc(msg) +
+        ' The server refuses every add while the VPN is down &mdash; the button below is just a courtesy.' +
+        '</div><div style="margin-top:11px"><button class="btn go" onclick="doConnect()">Connect PIA</button></div></div>';
+    }
+    bannerShown = true;
   } else {
     bannerShown = false;
+    g.dataset.banner = '';
     if (!g.dataset.addbox) {
       g.dataset.addbox = '1';
       g.innerHTML = '<div class="card"><h3>Add a torrent</h3>' +
@@ -2587,8 +2673,10 @@ async function loadTorrents() {
         '<td class="num">' + esc(t.down) + '</td><td class="num">' + esc(t.up) + '</td>' +
         '<td class="num">' + esc(t.eta) + '</td><td class="num">' + esc(t.size) + '</td>' +
         '<td style="white-space:nowrap">' +
-        (t.status === 0 ? '<button class="btn small go" onclick="trAct(\\'start\\',' + t.id + ')">Start</button>'
-                        : '<button class="btn small ghost" onclick="trAct(\\'stop\\',' + t.id + ')">Stop</button>') +
+        /* hashes, not numeric ids: the server matches them against the
+           watchdog's paused list, which is keyed by hash */
+        (t.status === 0 ? '<button class="btn small go" onclick="trAct(\\'start\\',\\'' + esc(t.hash) + '\\')">Start</button>'
+                        : '<button class="btn small ghost" onclick="trAct(\\'stop\\',\\'' + esc(t.hash) + '\\')">Stop</button>') +
         ' <button class="btn small danger" onclick="trRemove(' + t.id + ')">Remove</button></td></tr>';
     }).join('') + '</table>';
 }
@@ -2914,12 +3002,15 @@ $('btntorrentprobe').onclick = async (e) => {
     n++;
     const p = await jget('/api/leak/torrent/poll?thash=' + probe.thash);
     if (p.detected) {
-      const good = p.match;
+      const col = {vpn: 'var(--green-ink)', leak: 'var(--red-ink)'}[p.verdict] || 'var(--muted)';
+      const head = {vpn: 'MATCH — the tracker sees the VPN, not you',
+                    leak: 'LEAK — the tracker sees your real ISP'}[p.verdict] || 'INCONCLUSIVE';
       $('probeout').innerHTML =
         '<div>announced IP  ' + esc(p.ip) + (p.port ? ':' + p.port : '') + '</div>' +
-        '<div>piactl pubip  ' + esc(p.pia_pubip || '?') + '</div>' +
-        '<div style="font-weight:700;color:' + (good ? 'var(--green-ink)' : 'var(--red-ink)') + '">' +
-        (good ? 'MATCH — the tracker sees the VPN, not you' : 'MISMATCH — possible LEAK') + '</div>' +
+        '<div>isp           ' + esc(p.isp || '?') + '  (AS' + esc(p.asn || '?') + ')</div>' +
+        '<div>piactl pubip  ' + esc(p.pia_pubip || '?') + '  <span class="note">(advisory only)</span></div>' +
+        '<div style="font-weight:700;color:' + col + '">' + head + '</div>' +
+        '<div class="note">' + esc(p.detail || '') + '</div>' +
         (p.candidates && p.candidates.length > 1
           ? '<div class="note">other addresses in the response: ' + esc(p.candidates.slice(1).join(', ')) + '</div>' : '') +
         '<div class="note">raw: ' + esc(p.raw) + '</div>';
@@ -2975,8 +3066,9 @@ def selftest():
     ip = vpn_ip()
     check("vpn_ip() is None or an IPv4",
           ip is None or bool(re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip)), str(ip))
-    check("gate_ok() agrees with state+ip",
-          gate_ok() == (st == "Connected" and ip is not None), str(gate_ok()))
+    check("gate_ok() agrees with state+ip+bind address",
+          gate_ok() == (st == "Connected" and ip is not None
+                        and tunnel_bind_ip() is not None), str(gate_ok()))
     if st != "Connected":
         check("gate is SHUT while VPN is not Connected", gate_ok() is False)
         check("gate_reason() explains why", bool(gate_reason()), gate_reason())
@@ -3005,7 +3097,7 @@ def selftest():
     TR_CONFIG_DIR = os.path.join(scratch, "transmission")
     TR_DOWNLOAD_DIR = os.path.join(scratch, "dl")
     try:
-        for bad in ("", None, "not-an-ip", "999.999.1.1x"):
+        for bad in ("", None, "not-an-ip", "999.999.1.1x", "999.1.1.1", "0.0.0.0"):
             got = DAEMON.write_settings(bad)
             check(f"invalid bind {bad!r} -> 127.0.0.1 (never blank/0.0.0.0)",
                   got == "127.0.0.1", got)
@@ -3061,6 +3153,40 @@ def selftest():
         globals()["tr_stop_all"], globals()["tr_list"] = real_stop, real_list
         STATE.vpn, STATE.blocked = st, st != "Connected"
 
+    print("a stale Connected cannot re-open the gate")
+    started = []
+    saved = {k: globals()[k] for k in ("vpn_ip", "tunnel_bind_ip", "pia_region", "pub_ip",
+                                       "apply_port_forward", "tr_stop_all", "tr_list",
+                                       "gate_ok")}
+    real_auto = CFG["pia"].get("auto_resume_after_reconnect")
+    globals().update(vpn_ip=lambda: "212.32.69.17", tunnel_bind_ip=lambda: "10.9.0.2",
+                     pia_region=lambda: "nl", pub_ip=lambda: None,
+                     apply_port_forward=lambda: None, tr_stop_all=lambda: True,
+                     tr_list=lambda: [], gate_ok=lambda: True)
+    CFG["pia"]["auto_resume_after_reconnect"] = True
+    tr.call = lambda method, arguments=None, timeout=15: started.append(method) or {}
+    try:
+        # The VPN drops while the daemon is still being rebound for the
+        # Connected before it, and the poll thread handles the drop first.
+        DAEMON.rebind = lambda ip: on_state_change("Interrupted")
+        STATE.vpn, STATE.bound_ip, STATE.watchdog_paused = "Disconnected", None, ["ab" * 20]
+        on_state_change("Connected")
+        check("drop during bring-up leaves the gate SHUT", STATE.blocked is True, STATE.banner)
+        check("...and auto-resume does not fire", "torrent-start" not in started, str(started))
+        DAEMON.rebind = lambda ip: True
+        STATE.vpn, STATE.bound_ip = "Disconnected", None
+        on_state_change("Connected")
+        check("a clean bring-up still opens the gate", STATE.blocked is False)
+        check("...and auto-resumes what the watchdog paused", "torrent-start" in started,
+              str(started))
+    finally:
+        globals().update(saved)
+        CFG["pia"]["auto_resume_after_reconnect"] = real_auto
+        DAEMON.__dict__.pop("rebind", None)
+        tr.__dict__.pop("call", None)
+        STATE.vpn, STATE.blocked, STATE.bound_ip = st, st != "Connected", None
+        STATE.watchdog_paused = []
+
     print("ipleak parsing")
     # The live empty-state body, captured verbatim from ipleak.net.
     empty = (
@@ -3095,6 +3221,60 @@ def selftest():
           all("btih" not in c for c in r3["candidates"]))
     check("dns [] shape guarded", _dns_shape({"ip": []}) == {})
     check("dns {} shape read", _dns_shape({"ip": {"8.8.8.8": 3}}) == {"8.8.8.8": 3})
+
+    print("local-only API (CSRF / DNS rebinding)")
+    import io
+    client = app.test_client()
+    # /api/hitomi/send with no URL is a harmless probe: 400 when the request
+    # is let through, 403 when the guard refuses it.
+    evil = {"Origin": "https://evil.example"}
+    r = client.post("/api/hitomi/send", json={}, headers=evil)
+    check("cross-origin JSON post refused", r.status_code == 403, str(r.status_code))
+    r = client.post("/api/torrent/add", headers=evil, content_type="multipart/form-data",
+                    data={"torrent": (io.BytesIO(b"d4:infod4:name1:xee"), "x.torrent")})
+    check("cross-origin .torrent form upload refused", r.status_code == 403, str(r.status_code))
+    r = client.post("/api/hitomi/send", json={}, headers={"Origin": "null"})
+    check("opaque 'null' origin refused", r.status_code == 403, str(r.status_code))
+    r = client.post("/api/hitomi/send", json={}, headers={"Origin": "http://localhost"})
+    check("same-origin post allowed", r.status_code == 400, str(r.status_code))
+    r = client.post("/api/hitomi/send", json={})
+    check("origin-less post (curl) allowed", r.status_code == 400, str(r.status_code))
+    r = client.get("/health", base_url="http://rebind.evil.example:8133")
+    check("foreign Host refused (DNS rebinding)", r.status_code == 403, str(r.status_code))
+    r = client.get("/health", base_url="http://127.0.0.1:8133")
+    check("loopback Host served", r.status_code == 200, str(r.status_code))
+
+    print("leak verdicts (shared by the IP check and the torrent probe)")
+    real_isp = {"ip": "198.51.100.7", "asn": 7922, "isp": "Real ISP"}
+    saved = {k: globals()[k] for k in
+             ("_endpoint_asn", "torrent_probe_poll", "pub_ip", "_geo", "_baseline_isp")}
+    globals()["_endpoint_asn"] = lambda: 9009
+    try:
+        v, _ = _egress_verdict("198.51.100.7", 7922, "Real ISP", "198.51.100.7", real_isp)
+        check("real-ISP egress is a LEAK even when piactl's pubip agrees", v == "leak", v)
+        v, _ = _egress_verdict("198.51.100.99", 7922, "Real ISP", None, real_isp)
+        check("a new dynamic IP on the real ISP is still a LEAK", v == "leak", v)
+        v, _ = _egress_verdict("203.0.113.5", 9009, "M247", "198.51.100.7", real_isp)
+        check("egress on the PIA server's network holds", v == "vpn", v)
+        v, _ = _egress_verdict("203.0.113.5", None, None, None, real_isp)
+        check("unknown network vs a baseline is INCONCLUSIVE, not holding", v == "unknown", v)
+        v, _ = _egress_verdict("203.0.113.5", 64500, "Other", None, {})
+        check("no baseline + no endpoint match is INCONCLUSIVE", v == "unknown", v)
+
+        # The probe used to call it a MATCH whenever the tracker's IP equalled
+        # pubip - so a leaking announce, with pubip on the real ISP, got a
+        # green light.
+        globals().update(
+            torrent_probe_poll=lambda h: {"detected": True, "ip": "198.51.100.7",
+                                          "port": 51413, "candidates": [], "raw": ""},
+            pub_ip=lambda: "198.51.100.7",
+            _geo=lambda ip: {"ip": ip, "isp": "Real ISP", "asn": 7922, "country": "US"},
+            _baseline_isp=lambda: real_isp)
+        p = client.get("/api/leak/torrent/poll?thash=" + "a" * 40).get_json()
+        check("probe: leaking announce is a LEAK, not a MATCH, when pubip agrees",
+              p.get("verdict") == "leak" and p.get("match") is False, str(p.get("verdict")))
+    finally:
+        globals().update(saved)
 
     print("version discipline")
     check("DF_VERSION is 1.0", DF_VERSION == "1.0")
