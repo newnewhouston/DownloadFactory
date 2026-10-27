@@ -336,6 +336,7 @@ class AppState:
         self.last_dns = None
         self.events = []                # rolling activity log for the UI
         self.monitor_alive = False
+        self.transitions = 0            # bumped per state change; see on_state_change
 
     def event(self, kind, msg):
         with self.lock:
@@ -774,6 +775,9 @@ def on_state_change(state):
     with STATE.lock:
         prev = STATE.vpn
         STATE.vpn = state
+        if state != prev:
+            STATE.transitions += 1
+        gen = STATE.transitions
     if state == prev:
         return
 
@@ -796,13 +800,22 @@ def on_state_change(state):
         elif not DAEMON.running():
             DAEMON.start(bind, paused=True)
         apply_port_forward()
+        pub = pub_ip()
         with STATE.lock:
-            STATE.pub_ip = pub_ip()
+            # The rebind above can take tens of seconds, and the poll thread
+            # may have handled a drop meanwhile. Unblocking now would undo that
+            # stop - and the monitor's queued line for the drop is then a
+            # repeat of the current state, so nothing would ever re-stop it.
+            # Only the newest transition gets to open the gate.
+            if STATE.transitions != gen:
+                return
+            STATE.pub_ip = pub
             STATE.blocked = False
             STATE.banner = ""
         # Torrents stay paused by design; the user resumes. Opt-in auto-resume
-        # only ever touches the exact set the watchdog itself paused.
-        if CFG["pia"].get("auto_resume_after_reconnect"):
+        # only ever touches the exact set the watchdog itself paused, and goes
+        # through the live gate like any other start.
+        if CFG["pia"].get("auto_resume_after_reconnect") and gate_ok():
             with STATE.lock:
                 hashes = list(STATE.watchdog_paused)
                 STATE.watchdog_paused = []
@@ -3102,6 +3115,40 @@ def selftest():
     finally:
         globals()["tr_stop_all"], globals()["tr_list"] = real_stop, real_list
         STATE.vpn, STATE.blocked = st, st != "Connected"
+
+    print("a stale Connected cannot re-open the gate")
+    started = []
+    saved = {k: globals()[k] for k in ("vpn_ip", "tunnel_bind_ip", "pia_region", "pub_ip",
+                                       "apply_port_forward", "tr_stop_all", "tr_list",
+                                       "gate_ok")}
+    real_auto = CFG["pia"].get("auto_resume_after_reconnect")
+    globals().update(vpn_ip=lambda: "212.32.69.17", tunnel_bind_ip=lambda: "10.9.0.2",
+                     pia_region=lambda: "nl", pub_ip=lambda: None,
+                     apply_port_forward=lambda: None, tr_stop_all=lambda: True,
+                     tr_list=lambda: [], gate_ok=lambda: True)
+    CFG["pia"]["auto_resume_after_reconnect"] = True
+    tr.call = lambda method, arguments=None, timeout=15: started.append(method) or {}
+    try:
+        # The VPN drops while the daemon is still being rebound for the
+        # Connected before it, and the poll thread handles the drop first.
+        DAEMON.rebind = lambda ip: on_state_change("Interrupted")
+        STATE.vpn, STATE.bound_ip, STATE.watchdog_paused = "Disconnected", None, ["ab" * 20]
+        on_state_change("Connected")
+        check("drop during bring-up leaves the gate SHUT", STATE.blocked is True, STATE.banner)
+        check("...and auto-resume does not fire", "torrent-start" not in started, str(started))
+        DAEMON.rebind = lambda ip: True
+        STATE.vpn, STATE.bound_ip = "Disconnected", None
+        on_state_change("Connected")
+        check("a clean bring-up still opens the gate", STATE.blocked is False)
+        check("...and auto-resumes what the watchdog paused", "torrent-start" in started,
+              str(started))
+    finally:
+        globals().update(saved)
+        CFG["pia"]["auto_resume_after_reconnect"] = real_auto
+        DAEMON.__dict__.pop("rebind", None)
+        tr.__dict__.pop("call", None)
+        STATE.vpn, STATE.blocked, STATE.bound_ip = st, st != "Connected", None
+        STATE.watchdog_paused = []
 
     print("ipleak parsing")
     # The live empty-state body, captured verbatim from ipleak.net.
