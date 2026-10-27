@@ -1306,6 +1306,32 @@ def human_bytes(n):
     return f"{n:.1f} PB"
 
 
+@app.before_request
+def _local_page_only():
+    """Refuse requests that some OTHER web page aimed at us.
+
+    Binding 127.0.0.1 keeps the LAN out, not the browser: any site the user
+    has open can auto-submit a form to http://127.0.0.1:8133/api/... - no
+    CORS preflight is needed for a form post. Unchecked, that would let a
+    random page disconnect the VPN, shut the app down, or push a .torrent
+    through the multipart branch of /api/torrent/add.
+
+      * Host must be loopback. A DNS-rebinding page arrives carrying its own
+        hostname, and this is what stops it reading /api/state.
+      * A mutating request carrying an Origin must carry OUR origin.
+        Browsers always send Origin on a cross-origin POST; curl and the
+        self-test send none, so those still work.
+    """
+    if request.host.split(":", 1)[0].lower() not in ("127.0.0.1", "localhost"):
+        return jsonify(ok=False, error="forbidden host"), 403
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    origin = request.headers.get("Origin")
+    if origin is not None and origin.lower() != f"http://{request.host}".lower():
+        return jsonify(ok=False, error="cross-origin request refused"), 403
+    return None
+
+
 @app.after_request
 def _no_store(resp):
     resp.headers["Cache-Control"] = "no-store"
@@ -3095,6 +3121,28 @@ def selftest():
           all("btih" not in c for c in r3["candidates"]))
     check("dns [] shape guarded", _dns_shape({"ip": []}) == {})
     check("dns {} shape read", _dns_shape({"ip": {"8.8.8.8": 3}}) == {"8.8.8.8": 3})
+
+    print("local-only API (CSRF / DNS rebinding)")
+    import io
+    client = app.test_client()
+    # /api/hitomi/send with no URL is a harmless probe: 400 when the request
+    # is let through, 403 when the guard refuses it.
+    evil = {"Origin": "https://evil.example"}
+    r = client.post("/api/hitomi/send", json={}, headers=evil)
+    check("cross-origin JSON post refused", r.status_code == 403, str(r.status_code))
+    r = client.post("/api/torrent/add", headers=evil, content_type="multipart/form-data",
+                    data={"torrent": (io.BytesIO(b"d4:infod4:name1:xee"), "x.torrent")})
+    check("cross-origin .torrent form upload refused", r.status_code == 403, str(r.status_code))
+    r = client.post("/api/hitomi/send", json={}, headers={"Origin": "null"})
+    check("opaque 'null' origin refused", r.status_code == 403, str(r.status_code))
+    r = client.post("/api/hitomi/send", json={}, headers={"Origin": "http://localhost"})
+    check("same-origin post allowed", r.status_code == 400, str(r.status_code))
+    r = client.post("/api/hitomi/send", json={})
+    check("origin-less post (curl) allowed", r.status_code == 400, str(r.status_code))
+    r = client.get("/health", base_url="http://rebind.evil.example:8133")
+    check("foreign Host refused (DNS rebinding)", r.status_code == 403, str(r.status_code))
+    r = client.get("/health", base_url="http://127.0.0.1:8133")
+    check("loopback Host served", r.status_code == 200, str(r.status_code))
 
     print("version discipline")
     check("DF_VERSION is 1.0", DF_VERSION == "1.0")
