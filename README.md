@@ -216,8 +216,10 @@ DNS is leaking.
 
 **Verify torrent IP** — the money feature. Generates a throwaway 40-hex hash, announces it
 to ipleak's tracker **through the same gated add path** as any other torrent, then polls
-every 10 s and compares the IP the tracker saw against `piactl get pubip`. Match = the
-tunnel is holding. With the VPN off the probe is refused, so nothing ever announces.
+every 10 s and judges the IP the tracker saw by the **same rules as the IP check** — real
+ISP first, then your PIA server's network. A bare match against `piactl get pubip` is not
+trusted on its own: pubip can report your real ISP address, and a leaking announce would
+then "match" it. With the VPN off the probe is refused, so nothing ever announces.
 
 Run `py -3 "DownloadFactory 1.0.py" --selftest` for 40 headless assertions covering the
 gate, fail-closed behaviour, the settings writer, secret hygiene and the ipleak parsers.

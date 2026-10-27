@@ -1580,6 +1580,47 @@ def _remember_baseline(res):
         pass
 
 
+def _egress_verdict(ip, asn, isp, pia_pubip, base):
+    """(verdict, detail) for an address the outside world saw while PIA claims
+    to be up. The IP check and the torrent probe both go through here so the
+    two can never disagree about what counts as a leak.
+
+    Order matters. piactl's pubip has been seen reporting the REAL ISP
+    address on a healthy tunnel, so a leak can "match" it too - the real-ISP
+    baseline is checked before pubip is consulted at all.
+    """
+    if base and ((asn and asn == base.get("asn")) or ip == base.get("ip")):
+        return "leak", (f"Egress is on your REAL ISP ({isp or base.get('isp')}) - traffic "
+                        f"is bypassing the tunnel. This is a genuine leak.")
+    if pia_pubip and ip == pia_pubip:
+        return "vpn", "Egress matches PIA's reported public IP."
+    # Positive proof, independent of any baseline: does the egress sit in
+    # the same network as the PIA endpoint we are tunnelled to? If so the
+    # tunnel is certainly carrying traffic.
+    endpoint_asn = _endpoint_asn()
+    if endpoint_asn and asn == endpoint_asn:
+        return "vpn", (f"Egress is on the same network as the PIA server we are "
+                       f"connected to ({isp}, AS{endpoint_asn}). The tunnel is holding."
+                       + (" (piactl's pubip disagrees, which is common on OpenVPN "
+                          "- the observed egress is authoritative.)" if pia_pubip else ""))
+    if base and asn:
+        return "vpn", (f"Egress is {isp or 'a VPN host'}, not your real "
+                       f"ISP ({base.get('isp')}). The tunnel is holding.")
+    if base:
+        # A different IP alone proves nothing: the real ISP may simply have
+        # handed out a new dynamic address. Without the ASN we cannot tell.
+        return "unknown", (f"Couldn't look up which network {ip} belongs to, so it "
+                           f"can't be compared against your real ISP "
+                           f"({base.get('isp')}). Re-run the check.")
+    # No baseline AND no endpoint match: we genuinely cannot prove this
+    # either way. Saying "holding" here would be a green light we have
+    # not earned - a real leak would land in exactly this branch.
+    return "unknown", (f"Egress is {isp or 'unknown'} (AS{asn}), "
+                       "which is neither your PIA server's network nor a known "
+                       "baseline. Run this check once with the VPN OFF so I can "
+                       "learn what your real ISP looks like, then re-run it.")
+
+
 @app.get("/api/leak/ip")
 def api_leak_ip():
     """Verdict logic, rewritten after a live false positive.
@@ -1611,44 +1652,10 @@ def api_leak_ip():
         res["verdict"] = "unknown"
         res["matches_vpn"] = False
         res["detail"] = "Could not reach ipleak.net or the fallback."
-    elif base and (res.get("asn") == base.get("asn") or res.get("ip") == base.get("ip")):
-        res["verdict"] = "leak"
-        res["matches_vpn"] = False
-        res["detail"] = (f"Egress is on your REAL ISP ({res.get('isp')}) - traffic is "
-                         f"bypassing the tunnel. This is a genuine leak.")
-    elif res.get("pia_pubip") and res["ip"] == res["pia_pubip"]:
-        res["verdict"] = "vpn"
-        res["matches_vpn"] = True
-        res["detail"] = "Egress matches PIA's reported public IP."
     else:
-        # Positive proof, independent of any baseline: does the egress sit in
-        # the same network as the PIA endpoint we are tunnelled to? If so the
-        # tunnel is certainly carrying traffic.
-        endpoint_asn = _endpoint_asn()
-        if endpoint_asn and res.get("asn") == endpoint_asn:
-            res["verdict"] = "vpn"
-            res["matches_vpn"] = True
-            res["detail"] = (f"Egress is on the same network as the PIA server we are "
-                             f"connected to ({res.get('isp')}, AS{endpoint_asn}). The "
-                             f"tunnel is holding."
-                             + (" (piactl's pubip disagrees, which is common on OpenVPN "
-                                "- the observed egress is authoritative.)"
-                                if res.get("pia_pubip") and res["ip"] != res["pia_pubip"] else ""))
-        elif base:
-            res["verdict"] = "vpn"
-            res["matches_vpn"] = True
-            res["detail"] = (f"Egress is {res.get('isp') or 'a VPN host'}, not your real "
-                             f"ISP ({base.get('isp')}). The tunnel is holding.")
-        else:
-            # No baseline AND no endpoint match: we genuinely cannot prove this
-            # either way. Saying "holding" here would be a green light we have
-            # not earned - a real leak would land in exactly this branch.
-            res["verdict"] = "unknown"
-            res["matches_vpn"] = False
-            res["detail"] = (f"Egress is {res.get('isp') or 'unknown'} (AS{res.get('asn')}), "
-                             "which is neither your PIA server's network nor a known "
-                             "baseline. Run this check once with the VPN OFF so I can "
-                             "learn what your real ISP looks like, then re-run it.")
+        res["verdict"], res["detail"] = _egress_verdict(
+            res.get("ip"), res.get("asn"), res.get("isp"), res["pia_pubip"], base)
+        res["matches_vpn"] = res["verdict"] == "vpn"
 
     res["checked"] = time.strftime("%H:%M:%S")
     with STATE.lock:
@@ -1701,7 +1708,13 @@ def api_leak_torrent_poll():
     res["ok"] = True
     res["pia_pubip"] = pub_ip()
     if res.get("detected") and res.get("ip"):
-        res["match"] = (res["ip"] == res["pia_pubip"])
+        # Same rules as the IP check - NOT bare equality with pubip, which can
+        # report the real ISP address and would then call a leak a match.
+        geo = _geo(res["ip"])
+        res.update(isp=geo["isp"], asn=geo["asn"], country=geo["country"])
+        res["verdict"], res["detail"] = _egress_verdict(
+            res["ip"], geo["asn"], geo["isp"], res["pia_pubip"], _baseline_isp())
+        res["match"] = res["verdict"] == "vpn"
     return jsonify(res)
 
 
@@ -2418,8 +2431,8 @@ PAGE = """<!DOCTYPE html>
     <div class="card">
       <h3>Torrent address verification</h3>
       <p class="note">Announces a throwaway hash to ipleak.net's tracker through the
-      <b>same gated path</b> as any torrent, then compares the IP the tracker saw against
-      PIA's public IP. With the VPN off this is refused, so nothing ever announces.</p>
+      <b>same gated path</b> as any torrent, then judges the IP the tracker saw by the same
+      rules as the IP check. With the VPN off this is refused, so nothing ever announces.</p>
       <div class="row" style="margin-top:10px">
         <button class="btn" id="btntorrentprobe">Verify torrent IP</button>
         <button class="btn ghost small" id="btnprobestop" style="display:none">Stop probe</button>
@@ -2940,12 +2953,15 @@ $('btntorrentprobe').onclick = async (e) => {
     n++;
     const p = await jget('/api/leak/torrent/poll?thash=' + probe.thash);
     if (p.detected) {
-      const good = p.match;
+      const col = {vpn: 'var(--green-ink)', leak: 'var(--red-ink)'}[p.verdict] || 'var(--muted)';
+      const head = {vpn: 'MATCH — the tracker sees the VPN, not you',
+                    leak: 'LEAK — the tracker sees your real ISP'}[p.verdict] || 'INCONCLUSIVE';
       $('probeout').innerHTML =
         '<div>announced IP  ' + esc(p.ip) + (p.port ? ':' + p.port : '') + '</div>' +
-        '<div>piactl pubip  ' + esc(p.pia_pubip || '?') + '</div>' +
-        '<div style="font-weight:700;color:' + (good ? 'var(--green-ink)' : 'var(--red-ink)') + '">' +
-        (good ? 'MATCH — the tracker sees the VPN, not you' : 'MISMATCH — possible LEAK') + '</div>' +
+        '<div>isp           ' + esc(p.isp || '?') + '  (AS' + esc(p.asn || '?') + ')</div>' +
+        '<div>piactl pubip  ' + esc(p.pia_pubip || '?') + '  <span class="note">(advisory only)</span></div>' +
+        '<div style="font-weight:700;color:' + col + '">' + head + '</div>' +
+        '<div class="note">' + esc(p.detail || '') + '</div>' +
         (p.candidates && p.candidates.length > 1
           ? '<div class="note">other addresses in the response: ' + esc(p.candidates.slice(1).join(', ')) + '</div>' : '') +
         '<div class="note">raw: ' + esc(p.raw) + '</div>';
@@ -3143,6 +3159,38 @@ def selftest():
     check("foreign Host refused (DNS rebinding)", r.status_code == 403, str(r.status_code))
     r = client.get("/health", base_url="http://127.0.0.1:8133")
     check("loopback Host served", r.status_code == 200, str(r.status_code))
+
+    print("leak verdicts (shared by the IP check and the torrent probe)")
+    real_isp = {"ip": "198.51.100.7", "asn": 7922, "isp": "Real ISP"}
+    saved = {k: globals()[k] for k in
+             ("_endpoint_asn", "torrent_probe_poll", "pub_ip", "_geo", "_baseline_isp")}
+    globals()["_endpoint_asn"] = lambda: 9009
+    try:
+        v, _ = _egress_verdict("198.51.100.7", 7922, "Real ISP", "198.51.100.7", real_isp)
+        check("real-ISP egress is a LEAK even when piactl's pubip agrees", v == "leak", v)
+        v, _ = _egress_verdict("198.51.100.99", 7922, "Real ISP", None, real_isp)
+        check("a new dynamic IP on the real ISP is still a LEAK", v == "leak", v)
+        v, _ = _egress_verdict("203.0.113.5", 9009, "M247", "198.51.100.7", real_isp)
+        check("egress on the PIA server's network holds", v == "vpn", v)
+        v, _ = _egress_verdict("203.0.113.5", None, None, None, real_isp)
+        check("unknown network vs a baseline is INCONCLUSIVE, not holding", v == "unknown", v)
+        v, _ = _egress_verdict("203.0.113.5", 64500, "Other", None, {})
+        check("no baseline + no endpoint match is INCONCLUSIVE", v == "unknown", v)
+
+        # The probe used to call it a MATCH whenever the tracker's IP equalled
+        # pubip - so a leaking announce, with pubip on the real ISP, got a
+        # green light.
+        globals().update(
+            torrent_probe_poll=lambda h: {"detected": True, "ip": "198.51.100.7",
+                                          "port": 51413, "candidates": [], "raw": ""},
+            pub_ip=lambda: "198.51.100.7",
+            _geo=lambda ip: {"ip": ip, "isp": "Real ISP", "asn": 7922, "country": "US"},
+            _baseline_isp=lambda: real_isp)
+        p = client.get("/api/leak/torrent/poll?thash=" + "a" * 40).get_json()
+        check("probe: leaking announce is a LEAK, not a MATCH, when pubip agrees",
+              p.get("verdict") == "leak" and p.get("match") is False, str(p.get("verdict")))
+    finally:
+        globals().update(saved)
 
     print("version discipline")
     check("DF_VERSION is 1.0", DF_VERSION == "1.0")
