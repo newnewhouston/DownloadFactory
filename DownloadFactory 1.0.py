@@ -967,11 +967,19 @@ class YtdlpWorker:
             pass
         return None
 
+    STILL_STARTING = ("the worker is still starting - its first run installs ffmpeg/node "
+                      "via winget and can take a few minutes")
+
     def start(self):
         if self.health():
             self.adopted = True   # already running (dev server, earlier session)
             self.error = ""
             return True
+        if self.proc is not None and self.proc.poll() is None:
+            # Ours, alive, just not answering yet. Another copy would only
+            # race it for the port.
+            self.error = self.STILL_STARTING
+            return False
         cmds = []
         if os.path.exists(self.script):
             cmds.append([sys.executable, self.script, "--no-browser", "--port", str(self.port)])
@@ -998,7 +1006,12 @@ class YtdlpWorker:
                     STATE.event("video", f"yt-dlp worker up on {self.port}")
                     return True
                 time.sleep(0.5)
-            self.error = "worker started but /health never answered"
+            if self.proc.poll() is None:
+                # Slow, not dead: leave it to finish rather than launching
+                # the fallback on top of it.
+                self.error = self.STILL_STARTING
+                return False
+            self.error = f"worker exited before /health answered (rc={self.proc.returncode})"
         return False
 
     def _session_token(self):
