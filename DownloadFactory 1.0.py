@@ -2532,16 +2532,23 @@ function render() {
     $('egresschip').textContent = 'unchecked';
   }
 
-  /* gate area */
+  /* gate area. render() runs every 2 s, so the banner is only rebuilt when
+     what it says changes - recreating it each tick replayed the pulse forever
+     and could swallow a click on its Connect button mid-press. */
   const g = $('gatearea');
   if (!up) {
-    if (!bannerShown) { bannerShown = true; }
-    g.innerHTML = '<div class="banner pulse"><div class="bt">VPN required</div>' +
-      '<div class="bd">' + esc(s.banner || 'Torrents are blocked until PIA is connected.') +
-      ' The server refuses every add while the VPN is down &mdash; the button below is just a courtesy.' +
-      '</div><div style="margin-top:11px"><button class="btn go" onclick="doConnect()">Connect PIA</button></div></div>';
+    const msg = s.banner || 'Torrents are blocked until PIA is connected.';
+    if (g.dataset.banner !== msg) {
+      g.dataset.banner = msg;
+      g.innerHTML = '<div class="banner' + (bannerShown ? '' : ' pulse') + '"><div class="bt">VPN required</div>' +
+        '<div class="bd">' + esc(msg) +
+        ' The server refuses every add while the VPN is down &mdash; the button below is just a courtesy.' +
+        '</div><div style="margin-top:11px"><button class="btn go" onclick="doConnect()">Connect PIA</button></div></div>';
+    }
+    bannerShown = true;
   } else {
     bannerShown = false;
+    g.dataset.banner = '';
     if (!g.dataset.addbox) {
       g.dataset.addbox = '1';
       g.innerHTML = '<div class="card"><h3>Add a torrent</h3>' +
