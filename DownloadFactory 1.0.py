@@ -1701,13 +1701,16 @@ def api_leak_torrent_start():
               f"&tr=https://ipleak.net/announce.php%3Fh%3D{thash}"
               f"&dn=ipleak.net+torrent+detection")
     if not DAEMON.running():
-        DAEMON.start(tunnel_bind_ip(), paused=False)
+        if not DAEMON.start(tunnel_bind_ip(), paused=False):
+            return jsonify(ok=False, error=STATE.tr_error or "Transmission is not running"), 200
     try:
         res = tr.call("torrent-add", {"filename": magnet, "paused": False,
                                       "download-dir": TR_DOWNLOAD_DIR}, timeout=25)
     except TransmissionError as e:
         return jsonify(ok=False, error=str(e)), 200
     added = res.get("torrent-added") or res.get("torrent-duplicate")
+    if not added:
+        return jsonify(ok=False, error="Transmission accepted nothing"), 200
     STATE.event("leak", f"torrent-address probe announced ({thash[:12]}...)")
     return jsonify(ok=True, thash=thash, id=added.get("id"), hash=added.get("hashString"))
 
