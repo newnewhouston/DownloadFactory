@@ -2646,8 +2646,10 @@ async function loadTorrents() {
         '<td class="num">' + esc(t.down) + '</td><td class="num">' + esc(t.up) + '</td>' +
         '<td class="num">' + esc(t.eta) + '</td><td class="num">' + esc(t.size) + '</td>' +
         '<td style="white-space:nowrap">' +
-        (t.status === 0 ? '<button class="btn small go" onclick="trAct(\\'start\\',' + t.id + ')">Start</button>'
-                        : '<button class="btn small ghost" onclick="trAct(\\'stop\\',' + t.id + ')">Stop</button>') +
+        /* hashes, not numeric ids: the server matches them against the
+           watchdog's paused list, which is keyed by hash */
+        (t.status === 0 ? '<button class="btn small go" onclick="trAct(\\'start\\',\\'' + esc(t.hash) + '\\')">Start</button>'
+                        : '<button class="btn small ghost" onclick="trAct(\\'stop\\',\\'' + esc(t.hash) + '\\')">Stop</button>') +
         ' <button class="btn small danger" onclick="trRemove(' + t.id + ')">Remove</button></td></tr>';
     }).join('') + '</table>';
 }
