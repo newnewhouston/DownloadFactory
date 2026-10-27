@@ -24,6 +24,7 @@ Localhost only. No LAN exposure, no cloud. Secrets never touch this folder.
 
 import argparse
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -506,6 +507,16 @@ def _existing_instance(port):
         return False
 
 
+def _bindable_ipv4(s):
+    """True only for a real dotted-quad IPv4 other than 0.0.0.0. A shape-only
+    regex would pass 999.1.1.1 (invalid, so Transmission falls back to every
+    interface) and 0.0.0.0 itself (every interface) - both full leaks."""
+    try:
+        return not ipaddress.IPv4Address(s).is_unspecified
+    except ValueError:
+        return False
+
+
 class TransmissionDaemon:
     """Owns transmission-daemon.exe as a foreground child process.
 
@@ -526,7 +537,7 @@ class TransmissionDaemon:
         back to 0.0.0.0 (a full leak) in that case. When there is no VPN we
         deliberately bind 127.0.0.1 so peer binds FAIL instead of leaking.
         """
-        if not bind_ipv4 or not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", bind_ipv4):
+        if not _bindable_ipv4(bind_ipv4):
             bind_ipv4 = "127.0.0.1"  # fail-closed, never blank
         os.makedirs(TR_CONFIG_DIR, exist_ok=True)
         os.makedirs(TR_DOWNLOAD_DIR, exist_ok=True)  # free-space RPC needs it to exist
@@ -3042,8 +3053,9 @@ def selftest():
     ip = vpn_ip()
     check("vpn_ip() is None or an IPv4",
           ip is None or bool(re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip)), str(ip))
-    check("gate_ok() agrees with state+ip",
-          gate_ok() == (st == "Connected" and ip is not None), str(gate_ok()))
+    check("gate_ok() agrees with state+ip+bind address",
+          gate_ok() == (st == "Connected" and ip is not None
+                        and tunnel_bind_ip() is not None), str(gate_ok()))
     if st != "Connected":
         check("gate is SHUT while VPN is not Connected", gate_ok() is False)
         check("gate_reason() explains why", bool(gate_reason()), gate_reason())
@@ -3072,7 +3084,7 @@ def selftest():
     TR_CONFIG_DIR = os.path.join(scratch, "transmission")
     TR_DOWNLOAD_DIR = os.path.join(scratch, "dl")
     try:
-        for bad in ("", None, "not-an-ip", "999.999.1.1x"):
+        for bad in ("", None, "not-an-ip", "999.999.1.1x", "999.1.1.1", "0.0.0.0"):
             got = DAEMON.write_settings(bad)
             check(f"invalid bind {bad!r} -> 127.0.0.1 (never blank/0.0.0.0)",
                   got == "127.0.0.1", got)
